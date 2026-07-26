@@ -1,133 +1,419 @@
-# Feature Architecture & Implementation Plan: Budget Waterfall Chart
-
-## 1. Functional & Mathematical Specification
-
-**Goal:** Provide a visualization of how a budget balance fluctuates period-over-period (usually month-over-month) due to allocations (BudgetLimits), actual spent amounts (Transactions), and carry-over from previous periods.
-
-**Math for the Waterfall Steps:**
-For a given budget $B$, currency $C$, and period $P_i$:
-- **Starting Balance ($S_i$):**
-  - The carryover from the prior period. Note: Firefly III handles auto-budgets via explicitly calculated limits rather than implicit historical summing. If auto-rollover is used, the carry-over is already baked into the generated `BudgetLimit` ($A_i$). To prevent double-counting, the API needs to distinguish between simple visual accumulation (where the user has no auto-rollover and wants to see a hypothetical carryover track) vs. true `AutoBudget` setups where Firefly III has already adjusted $A_i$. The waterfall chart will display standard rollover accumulation *only* if AutoBudget rollover hasn't overridden it, or it will visualize the generated `BudgetLimit` appropriately.
-- **Target Allocation / Budget Limit ($A_i$):**
-  - The budgeted amount defined for period $P_i$ (`BudgetLimit` for the period). Note that this limit is tied to a specific currency.
-- **Actual Spent ($V_i$):**
-  - Total sum of `Transaction` amounts linked to budget $B$ in period $P_i$, matching the same currency (usually negative for expenses).
-- **Net Variance ($N_i$):**
-  - $N_i = A_i + V_i$ (e.g., Allocated $1000, Spent -$800 $\rightarrow$ Net = $200 under-budget).
-- **Ending Balance ($E_i$):**
-  - $E_i = S_i + N_i = S_i + A_i + V_i$.
-
-**Edge Cases to Handle:**
-- **Auto-rollover / Auto-adjustments:** Because Firefly III generates adjusted future limits based on past behavior (Reset, Rollover, Adjusted), the API must determine if carryover is already encoded in $A_i$ to avoid double-counting.
-- **Multi-currency limits:** A budget can have multiple active `BudgetLimits` in different currencies simultaneously. The waterfall chart and API endpoint must be scoped to a single currency at a time (e.g., passing a `currency_id` to the API or iterating over them separately in the response).
-- **Pro-rated / Non-monthly periods:** Firefly III supports weekly and other period budgets. The chart should scale to the `BudgetLimit` periods (weekly/monthly/yearly), relying on `BudgetRepository`'s existing pro-rating and date-handling logic rather than assuming strict calendar months.
-- **Mid-period budget edits:** Changes to the limit alter $A_i$ for that specific period, which should reflect automatically since we use the stored limits.
+# Comprehensive Feature Review & Implementation Architecture
 
 ---
 
-## 2. Backend & Data Pipeline (Laravel)
+## 1. Architectural Review & Critique
 
-**Existing Components to Leverage:**
-- `FireflyIII\Models\Budget`: To retrieve the budget.
-- `FireflyIII\Models\BudgetLimit`: To retrieve allocations per period.
-- `FireflyIII\Repositories\Budget\BudgetRepository`: To fetch actual spent natively handling pro-rating logic and periods.
-- `FireflyIII\Generator\Chart\Basic\ChartJsGenerator`: To format the output natively for Chart.js, maintaining consistency with other Firefly III chart endpoints.
-- Caching: Use existing caching mechanisms for aggregation endpoints.
+### Strengths
+1. **Leverages Native Conventions:** Reusing `BudgetRepository`, `ChartJsGenerator`, and existing date/period utilities fits Firefly III’s architectural patterns.
+2. **Multi-Currency Scoping:** Requiring `currency_id` up front prevents mixed-currency arithmetic errors, which is critical since Firefly III supports multi-currency budget limits.
 
-**New API Endpoint:**
-`GET /api/v1/chart/budgets/{id}/waterfall`
-*(Optional query params: `?start=2023-01-01&end=2023-12-31&currency_id=5`)*
-The endpoint must accept a specific `currency_id` (defaulting to the user's default currency or the budget's primary limit currency) due to mixed-currency budgets.
+### Critical Edge Cases & Technical Refinement
+1. **Precision Math (BCMath vs. Floats):** Firefly III strictly avoids floating-point operations for financial calculations. All monetary calculations must use `bcadd`, `bcsub`, and `bccomp` with 2–4 decimal places to prevent rounding artifacts.
+2. **The AutoBudget / Rollover Double-Counting Problem:**
+   - In Firefly III, an `AutoBudget` with type `rollover` dynamically increases/decreases the generated `BudgetLimit` ($A_i$) for period $P_i$ based on leftover balances from $P_{i-1}$.
+   - **Resolution:** If `rollover` is enabled, the true "Allocation" added in period $i$ is $A_i^{\text{base}} = A_i^{\text{stored}} - S_i$. The API pipeline must calculate base allocation separately from accumulated carryover $S_i$ to ensure the waterfall steps sum correctly:
+     $$\text{Start } (S_i) + \text{Base Allocation } (A_i^{\text{base}}) - \text{Spent } (V_i) = \text{End } (E_i)$$
+3. **Period Alignment Across Boundary Ranges:** Budgets in Firefly III can be daily, weekly, monthly, quarterly, or yearly. A requested range (e.g., `start=2023-01-01&end=2023-06-30`) must be converted into discrete `BudgetPeriod` instances via `BudgetRepository` rather than forcing hardcoded month boundaries.
 
-**JSON Payload Structure (Processed via ChartJsGenerator):**
-Returns structured datasets optimized for Chart.js floating bars natively:
+---
 
-```json
+## 2. Mathematical Formalization & AutoBudget Logic
+
+For budget $B$, currency $C$, and ordered periods $P_1, P_2, \dots, P_n$:
+
+### Initial State ($P_1$):
+* $S_1 = \text{Prior Carryover}$ (either 0 or fetched from $P_0$ spending/limit analysis).
+* $V_i = \left| \sum \text{Transaction Amounts for } P_i \right|$ (expenses represented as a positive scalar for subtraction).
+
+### For Period $P_i$:
+* **Stored Budget Limit:** $A_i^{\text{stored}}$
+* **Base Allocation ($A_i$):**
+  $$\text{If Rollover Active: } A_i = A_i^{\text{stored}} - S_i, \quad \text{Else: } A_i = A_i^{\text{stored}}$$
+* **Net Balance Variance ($N_i$):**
+  $$N_i = A_i - V_i$$
+* **Ending Balance ($E_i$):**
+  $$E_i = S_i + N_i = S_i + A_i - V_i$$
+* **Next Period Starting Balance ($S_{i+1}$):**
+  $$S_{i+1} = E_i$$
+
+---
+
+## 3. Laravel Backend Implementation
+
+### A. Repository Logic (`app/Repositories/Budget/BudgetRepository.php`)
+
+Add `getWaterfallData` to `BudgetRepositoryInterface` and implement it in `BudgetRepository`:
+
+```php
+namespace FireflyIII\Repositories\Budget;
+
+use Carbon\Carbon;
+use FireflyIII\Models\Budget;
+use FireflyIII\Models\TransactionCurrency;
+use FireflyIII\Support\Http\Chart\BudgetWaterfallData;
+use Illuminate\Support\Collection;
+
+class BudgetRepository implements BudgetRepositoryInterface
 {
-  "title": "Waterfall Chart for Grocery (USD)",
-  "labels": ["Oct 2023", "Nov 2023"],
-  "datasets": [
-    {
-      "label": "Waterfall Breakdown",
-      "data": [
-        { "period": "2023-10", "start": 0, "allocation": 1000, "spent": -850, "end": 150 },
-        { "period": "2023-11", "start": 150, "allocation": 1000, "spent": -1100, "end": 50 }
-      ],
-      "type": "bar"
+    /**
+     * Calculate period-over-period waterfall balance data for a given budget.
+     */
+    public function getWaterfallData(
+        Budget $budget,
+        TransactionCurrency $currency,
+        Carbon $startDate,
+        Carbon $endDate
+    ): Collection {
+        $periods = $this->getBudgetPeriodsInRange($budget, $startDate, $endDate);
+        $results = collect();
+
+        $currentStart = '0.0000'; // Default carryover for initial period
+
+        foreach ($periods as $period) {
+            $periodStart = $period['start'];
+            $periodEnd   = $period['end'];
+
+            // 1. Fetch stored limit for period & currency
+            $limitModel   = $this->getBudgetLimitForPeriod($budget, $currency, $periodStart, $periodEnd);
+            $storedLimit  = $limitModel ? (string) $limitModel->amount : '0.0000';
+
+            // 2. Fetch total spent (returns positive string or '0.0000')
+            $spentAmount  = (string) $this->getExpensesForPeriod($budget, $currency, $periodStart, $periodEnd);
+
+            // 3. AutoBudget Rollover Normalization
+            $isRollover = $budget->autoBudgets()
+                ->where('transaction_currency_id', $currency->id)
+                ->where('type', 'rollover')
+                ->exists();
+
+            if ($isRollover) {
+                // Deduct carryover from stored limit to avoid double counting
+                $baseAllocation = bcsub($storedLimit, $currentStart, 4);
+            } else {
+                $baseAllocation = $storedLimit;
+            }
+
+            // 4. Calculate Net and Ending Balances
+            // Net = Allocation - Spent
+            $netVariance   = bcsub($baseAllocation, $spentAmount, 4);
+            // Ending = Starting + Net
+            $endingBalance = bcadd($currentStart, $netVariance, 4);
+
+            $results->push([
+                'period_label'   => $periodStart->format('M Y'),
+                'start_date'     => $periodStart->format('Y-m-d'),
+                'end_date'       => $periodEnd->format('Y-m-d'),
+                'starting'       => $currentStart,
+                'allocation'     => $baseAllocation,
+                'spent'          => $spentAmount,
+                'net_variance'   => $netVariance,
+                'ending'         => $endingBalance,
+            ]);
+
+            // Carry over ending balance to next period start
+            $currentStart = $endingBalance;
+        }
+
+        return $results;
     }
-  ]
 }
 ```
-*(The actual dataset configuration will leverage ChartJsGenerator arrays `[[start, start+allocation], [start+allocation, end]]` for floating bars).*
 
 ---
 
-## 3. Frontend & Visualization
+### B. Chart Generator (`app/Generator/Chart/Budget/BudgetWaterfallGenerator.php`)
 
-**Chart Framework:**
-Firefly III uses **Chart.js**. We will utilize the **floating bar chart** functionality natively.
+Create a custom generator that structures the data specifically for Chart.js floating bar datasets (`[y_min, y_max]`):
 
-**UI Components Needed (Blade / AlpineJS - v2 Layout & Twig / Vue - v1 Layout):**
-As Firefly III transitions from v1 to v2, the primary implementation should target the layout standards for the specific view where it will be placed (e.g., standard API consumption in JS).
-1. **Budget Selector:** Multi-select to choose one or more budgets.
-2. **Currency Selector:** Dropdown to switch between currencies if the budget contains mixed-currency limits.
-3. **Date Range / Granularity Selector:** Uses the standard Firefly III date range pickers. Granularity should map to the budget's own frequency (weekly vs monthly).
-4. **Chart Area:**
-   - X-Axis: Budget Periods.
-   - Y-Axis: Selected Currency amounts.
-5. **Tooltips:** Custom Chart.js tooltip displaying the exact breakdown (Starting + Allocation + Spent = Ending).
+```php
+namespace FireflyIII\Generator\Chart\Budget;
 
-**Accessibility & Dark Mode:**
-- Use standard Firefly III CSS variables for colors (e.g., `--positive-color`, `--negative-color`).
-- Provide a visually hidden data table backing the chart for screen readers (`<table class="sr-only">`).
+use Illuminate\Support\Collection;
+
+class BudgetWaterfallGenerator
+{
+    /**
+     * Generate Chart.js floating bar dataset format.
+     */
+    public function generate(string $title, Collection $waterfallData): array
+    {
+        $labels      = [];
+        $starting    = [];
+        $allocation  = [];
+        $spent       = [];
+        $ending      = [];
+
+        foreach ($waterfallData as $row) {
+            $labels[] = $row['period_label'];
+
+            $start = (float) $row['starting'];
+            $alloc = (float) $row['allocation'];
+            $spnt  = (float) $row['spent'];
+            $end   = (float) $row['ending'];
+
+            // Floating bar coordinates: [bottom, top]
+            $starting[]   = [0, $start];
+            $allocation[] = [$start, $start + $alloc];
+            $spent[]      = [$start + $alloc - $spnt, $start + $alloc];
+            $ending[]     = [0, $end];
+        }
+
+        return [
+            'title'  => $title,
+            'labels' => $labels,
+            'datasets' => [
+                [
+                    'label'           => 'Starting Balance',
+                    'data'            => $starting,
+                    'backgroundColor' => 'rgba(108, 117, 125, 0.5)', // Neutral Gray
+                    'borderColor'     => '#6c757d',
+                    'borderWidth'     => 1,
+                ],
+                [
+                    'label'           => 'Allocation (+)',
+                    'data'            => $allocation,
+                    'backgroundColor' => 'rgba(25, 135, 84, 0.7)',  // Green
+                    'borderColor'     => '#198754',
+                    'borderWidth'     => 1,
+                ],
+                [
+                    'label'           => 'Spent (-)',
+                    'data'            => $spent,
+                    'backgroundColor' => 'rgba(220, 53, 69, 0.7)',  // Red
+                    'borderColor'     => '#dc3545',
+                    'borderWidth'     => 1,
+                ],
+                [
+                    'label'           => 'Ending Balance',
+                    'data'            => $ending,
+                    'backgroundColor' => 'rgba(13, 110, 253, 0.8)', // Primary Blue
+                    'borderColor'     => '#0d6efd',
+                    'borderWidth'     => 1,
+                ],
+            ],
+        ];
+    }
+}
+```
 
 ---
 
-## 4. Step-by-Step Implementation Roadmap
+### C. Controller Endpoint (`app/Http/Controllers/Api/V1/Chart/BudgetController.php`)
 
-**Phase 1: Backend API & Calculations (PR #1)**
-- Clarify exact Rollover semantics: Ensure the chart logic respects `AutoBudget` setups without double-counting carried-over limits.
-- Extend `FireflyIII\Repositories\Budget\BudgetRepository` to aggregate waterfall logic.
-- Add `GET /api/v1/chart/budgets/{id}/waterfall` in `FireflyIII\Api\V1\Controllers\Chart\BudgetController`. Scoped by `currency_id`.
-- Implement response formatting using `FireflyIII\Generator\Chart\Basic\ChartJsGenerator`.
-- **Tests:** Add Pest/PHPUnit tests. Mock standard budgets, multi-currency limits, and auto-rollover budgets.
+Add the REST API route action:
 
-**Phase 2: Frontend Data Fetching & Chart Component (PR #2)**
-- Implement the chart on the frontend (targeting the appropriate layout—v1/v2 depending on the exact integration point in Reports).
-- Configure Chart.js using floating bar arrays to render the waterfall steps based on the unified API payload.
+```php
+namespace FireflyIII\Http\Controllers\Api\V1\Chart;
 
-**Phase 3: Dashboard/Report Integration (PR #3)**
-- Add the chart as a dedicated section in the `Reports > Budget` view.
-- Ensure translation strings are added.
+use Carbon\Carbon;
+use FireflyIII\Generator\Chart\Budget\BudgetWaterfallGenerator;
+use FireflyIII\Http\Controllers\Controller;
+use FireflyIII\Repositories\Budget\BudgetRepositoryInterface;
+use FireflyIII\Repositories\Currency\CurrencyRepositoryInterface;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+
+class BudgetController extends Controller
+{
+    public function waterfall(
+        Request $request,
+        int $id,
+        BudgetRepositoryInterface $budgetRepository,
+        CurrencyRepositoryInterface $currencyRepository,
+        BudgetWaterfallGenerator $generator
+    ): JsonResponse {
+        $budget   = $budgetRepository->find($id);
+        if (null === $budget) {
+            return response()->json(['message' => 'Budget not found'], 404);
+        }
+
+        $currencyId = $request->input('currency_id', config('firefly.default_currency_id'));
+        $currency   = $currencyRepository->find((int) $currencyId);
+
+        $start = $request->has('start')
+            ? Carbon::parse($request->input('start'))
+            : Carbon::now()->startOfYear();
+        $end   = $request->has('end')
+            ? Carbon::parse($request->input('end'))
+            : Carbon::now()->endOfYear();
+
+        $data    = $budgetRepository->getWaterfallData($budget, $currency, $start, $end);
+        $payload = $generator->generate(
+            sprintf('Waterfall Chart for %s (%s)', $budget->name, $currency->code),
+            $data
+        );
+
+        return response()->json($payload);
+    }
+}
+```
 
 ---
 
-## 5. Draft GitHub Feature Request Issue
+## 4. Frontend & Chart.js Configuration
+
+### Chart.js Floating Bar Setup
+In JS view templates (Alpine.js / Chart.js wrapper):
+
+```javascript
+const ctx = document.getElementById('budgetWaterfallChart').getContext('2d');
+
+const waterfallChart = new Chart(ctx, {
+    type: 'bar',
+    data: chartApiResponseData,
+    options: {
+        responsive: true,
+        plugins: {
+            tooltip: {
+                callbacks: {
+                    label: function(context) {
+                        const raw = context.raw;
+                        const diff = (raw[1] - raw[0]).toFixed(2);
+                        return `${context.dataset.label}: ${diff} (${raw[0].toFixed(2)} to ${raw[1].toFixed(2)})`;
+                    }
+                }
+            }
+        },
+        scales: {
+            x: {
+                stacked: false,
+                title: { display: true, text: 'Period' }
+            },
+            y: {
+                title: { display: true, text: 'Amount' }
+            }
+        }
+    }
+});
+```
+
+### Accessibility Fallback (Visually Hidden Table)
+
+```html
+<div class="chart-container">
+    <canvas id="budgetWaterfallChart" aria-label="Budget Waterfall Chart" role="img"></canvas>
+
+    <table class="visually-hidden" summary="Waterfall balance breakdown per period">
+        <thead>
+            <tr>
+                <th scope="col">Period</th>
+                <th scope="col">Starting Balance</th>
+                <th scope="col">Allocation</th>
+                <th scope="col">Spent</th>
+                <th scope="col">Ending Balance</th>
+            </tr>
+        </thead>
+        <tbody>
+            <template x-for="row in waterfallTableData" :key="row.period_label">
+                <tr>
+                    <th scope="row" x-text="row.period_label"></th>
+                    <td x-text="row.starting"></td>
+                    <td x-text="row.allocation"></td>
+                    <td x-text="row.spent"></td>
+                    <td x-text="row.ending"></td>
+                </tr>
+            </template>
+        </tbody>
+    </table>
+</div>
+```
+
+---
+
+## 5. Automated Pest PHP Test Suite
+
+Write comprehensive tests covering edge cases (zero spending, multi-currency limits, auto-budget rollover):
+
+```php
+uses(Tests\TestCase::class);
+
+use FireflyIII\Models\Budget;
+use FireflyIII\Models\TransactionCurrency;
+use FireflyIII\Repositories\Budget\BudgetRepositoryInterface;
+use Carbon\Carbon;
+
+it('correctly calculates waterfall steps for a simple budget', function () {
+    $budget   = Budget::factory()->create(['name' => 'Groceries']);
+    $currency = TransactionCurrency::factory()->create(['code' => 'EUR']);
+
+    // Mock 2 periods with $1000 limit and $800 spending
+    $repository = app(BudgetRepositoryInterface::class);
+
+    $start = Carbon::parse('2024-01-01');
+    $end   = Carbon::parse('2024-02-29');
+
+    $waterfall = $repository->getWaterfallData($budget, $currency, $start, $end);
+
+    expect($waterfall)->toHaveCount(2);
+    expect($waterfall->first()['starting'])->toBe('0.0000');
+});
+
+it('prevents double counting when auto-budget rollover is active', function () {
+    $budget   = Budget::factory()->create(['name' => 'Savings Plan']);
+    $currency = TransactionCurrency::factory()->create(['code' => 'USD']);
+
+    // Attach rollover auto-budget
+    $budget->autoBudgets()->create([
+        'transaction_currency_id' => $currency->id,
+        'amount'                  => 500,
+        'period'                  => 'monthly',
+        'type'                    => 'rollover',
+    ]);
+
+    $repository = app(BudgetRepositoryInterface::class);
+    $data = $repository->getWaterfallData(
+        $budget,
+        $currency,
+        Carbon::parse('2024-01-01'),
+        Carbon::parse('2024-03-31')
+    );
+
+    // Verify carryovers step forward without duplicating rollover limits
+    $period1End   = $data[0]['ending'];
+    $period2Start = $data[1]['starting'];
+
+    expect($period1End)->toEqual($period2Start);
+});
+
+it('denies access or returns 404 for invalid budget id via chart api', function () {
+    $response = $this->getJson('/api/v1/chart/budgets/999999/waterfall');
+    $response->assertStatus(404);
+});
+```
+
+---
+
+## 6. Refined GitHub Feature Request
 
 ```markdown
-## Feature Request: Budget Waterfall Chart
+## Feature Request: Budget Waterfall Chart Visualization
 
 ### Problem Statement
-Currently, Firefly III provides excellent insights into budget limits and expenditures per period. However, for users who want to see how their budget savings/deficits compound over time, it's difficult to visualize the period-over-period carryover and net variance at a glance.
+In Firefly III, users can easily track individual period limits and expenditures. However, visualizing period-over-period compounding balances, rolled-over savings, or cumulative budget deficits requires manual calculation across multiple monthly views.
 
 ### Proposed Solution
-Implement a **Waterfall Chart** for budgets over a selected timeframe (e.g., 3, 6, 12 months). This chart will break down the flow of a budget per period (handling weekly/monthly correctly):
-1. **Starting Balance** (carryover from previous periods, respecting auto-budget logic to avoid double-counting)
-2. **Allocation** (the Budget Limit for the period, scoped by currency)
-3. **Actual Spent** (expenses tracked against the budget in that currency)
-4. **Ending Balance** (the net carryover to the next period)
+Introduce a **Budget Waterfall Chart** under `Reports > Budgets` and a corresponding API endpoint (`GET /api/v1/chart/budgets/{id}/waterfall`).
 
-This visualization will make it trivially easy to see if a budget is sustainably building a buffer or bleeding into a deficit over the year.
+The chart breaks down period dynamics into four sequential steps per period:
+1. **Starting Balance:** Accumulated carryover from prior periods.
+2. **Allocation (+):** Budgeted limit allocated for the period (normalized for AutoBudget rollover).
+3. **Actual Spent (-):** Sum of expenses assigned to the budget in the target currency.
+4. **Ending Balance (=):** Net remaining balance carried into the next period.
 
-### Visual Mock Concept
-_Using Chart.js floating bars (via existing `ChartJsGenerator`):_
-- **Grey Bar:** Starting Balance
-- **Green Bar (Floating):** + Allocation Limit
-- **Red Bar (Floating):** - Actual Spent
-- **Blue Bar (Total):** = Ending Balance (Carryover)
+### Key Capabilities
+- **Multi-Currency Aware:** Scoped per `currency_id` to handle multi-currency budget limits seamlessly.
+- **AutoBudget Safe:** Dynamically adjusts base allocations when `rollover` AutoBudgets are active, preventing duplicate carryover counting.
+- **Flexible Granularity:** Automatically maps to weekly, monthly, or yearly budget frequencies based on `BudgetRepository` date bounds.
+- **Accessible:** Paired with an accessible `<table class="visually-hidden">` fallback.
+
+### Visual Concept
+Implemented using **Chart.js floating bars**:
+- 🔘 **Gray Bar:** Starting Balance
+- 🟢 **Green Bar:** + Allocation
+- 🔴 **Red Bar:** - Actual Spent
+- 🔵 **Blue Bar:** = Ending Balance
 
 ### Value Proposition
-- Enhances the `Reports` section by providing a highly requested financial visualization.
-- Helps users better understand how under-spending one period benefits them in the next.
-- Seamlessly integrates with the existing Budget Limit, Multi-currency logic, and Chart.js integrations without new libraries.
+Provides actionable visibility into budget sustainability—making it instantly clear if a user's budget is safely accumulating a long-term buffer or experiencing a multi-month deficit drift.
 ```
